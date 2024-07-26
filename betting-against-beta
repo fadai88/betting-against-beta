@@ -1,0 +1,225 @@
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from scipy.stats import linregress
+from heapq import nlargest, nsmallest
+from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor
+import warnings
+warnings.filterwarnings('ignore')
+
+
+# Load data
+data = pd.read_excel("sp500.xlsx", sheet_name="updated")
+ind = data[data['date'] == '2000-01-03'].index[0]
+data = data.iloc[ind:]
+data['date'] = pd.to_datetime(data['date']).apply(lambda x: x.strftime('%Y-%m-%d'))
+
+# Create tickers dictionary
+tickers = {data['date'][i]: data['tickers'][i].split(",") for i in range(ind, len(data)+ind)}
+
+risk_free_data = yf.download('^IRX', start="1999-01-01", end="2024-04-01")
+risk_free_data['Risk-Free Rate'] = risk_free_data['Adj Close'] / 100
+
+def calculate_stock_beta(stock_data, market_data, rf_data):
+    try:
+        stock_data['Return'] = stock_data['Adj Close'].pct_change()
+        market_data['Return'] = market_data['Adj Close'].pct_change()
+        
+        # Align risk-free data
+        rf_data = rf_data.reindex(stock_data.index).fillna(method='ffill')
+
+        # Calculate excess returns
+        stock_data['Excess Return'] = stock_data['Return'] - rf_data['Risk-Free Rate']
+        market_data['Excess Return'] = market_data['Return'] - rf_data['Risk-Free Rate']
+
+        merged_data = pd.merge(stock_data[['Excess Return']], market_data[['Excess Return']], left_index=True, right_index=True, suffixes=('_stock', '_market')).dropna()
+        if merged_data.empty:
+            return None
+        
+        beta, alpha, r_value, p_value, std_err = linregress(merged_data['Excess Return_market'], merged_data['Excess Return_stock'])
+        return beta
+    except Exception as e:
+        print(f"Error calculating beta: {e}")
+        return None
+
+def one_year_before(date_str):
+    date_format = "%Y-%m-%d"
+    original_date = datetime.strptime(date_str, date_format)
+    try:
+        one_year_before = original_date.replace(year=original_date.year - 1)
+    except ValueError:
+        one_year_before = original_date.replace(month=2, day=28, year=original_date.year - 1)
+    return one_year_before.strftime(date_format)
+
+def get_previous_date(dates_list, target_date_str):
+    dates = [datetime.strptime(date, '%Y-%m-%d') for date in dates_list]
+    target_date = datetime.strptime(target_date_str, '%Y-%m-%d')
+    dates.sort()
+    previous_date = None
+    for date in dates:
+        if date >= target_date:
+            break
+        previous_date = date
+    return previous_date.strftime('%Y-%m-%d') if previous_date else None
+
+def one_day_after(date_str):
+    date_format = "%Y-%m-%d"
+    date_obj = datetime.strptime(date_str, date_format)
+    one_day_after = date_obj + timedelta(days=1)
+    return one_day_after.strftime(date_format)
+
+# Initialize parameters
+date_format = "%Y-%m-%d"
+commission = 0.0005
+
+# Create date range
+month_end_range = pd.date_range('1-Jan-2000','1-Apr-2024', freq='M').strftime("%Y-%m-%d").tolist()
+dates_list = list(tickers.keys())
+
+# Collect all tickers
+all_tickers = set()
+for t in tickers.values():
+    all_tickers.update(t)
+all_tickers = list(all_tickers)
+# remove problematic tickers
+tickers_to_remove = ['TIE', 'BSC', 'BDK', 'CBE', 'ACS', 'MEE', 'BOL']
+filtered_tickers = [ticker for ticker in all_tickers if ticker not in tickers_to_remove]
+
+# Download all historical data
+print("Downloading historical data...")
+historical_data = yf.download(filtered_tickers, start="1999-01-01", end="2024-04-01", group_by='ticker')
+market_data = yf.download('^GSPC', start="1999-01-01", end="2024-04-01")
+
+
+def process_date(date):
+    nearest_date = get_previous_date(dates_list, date)
+    stock_list = tickers[nearest_date]
+    start_date = one_year_before(date)
+    beta_dict = {}
+
+    for stock in stock_list:
+        if stock not in historical_data:
+            #print(f"Missing data for stock: {stock}")
+            continue
+        stock_data = historical_data[stock].loc[start_date:date]
+        filtered_stock_data = stock_data[stock_data['Volume'] > 10000]
+        if filtered_stock_data.empty:
+            continue
+        beta = calculate_stock_beta(stock_data, market_data.loc[start_date:date], risk_free_data.loc[start_date:date])
+        if beta is not None:
+            beta_dict[stock] = beta
+
+    # delete stocks with negative betas. These are mostly data issues.
+    filtered_beta_dict = {k: v for k, v in beta_dict.items() if v > 0.2}
+    five_highest_betas = nlargest(5, filtered_beta_dict, key=filtered_beta_dict.get)
+    five_smallest_betas = nsmallest(5, filtered_beta_dict, key=filtered_beta_dict.get)
+    
+    short_returns = 0
+    long_returns = 0
+    # go short 5 stocks with the highest betas
+    for stock in five_highest_betas:
+        entry_date = one_day_after(date)
+        original_date = datetime.strptime(entry_date, date_format)
+        one_month_later = original_date + timedelta(days=30)
+        exit_date = one_day_after(one_month_later.strftime(date_format))
+        
+        if stock not in historical_data:
+            continue
+        prices = historical_data[stock].loc[entry_date:exit_date]
+        if prices.empty:
+            continue
+        try:
+            entry_price = prices.iloc[0]['Adj Close'] * (1 - commission)
+            exit_price = prices.iloc[-1]['Adj Close'] * (1 + commission)
+            monthly_stock_return = 1 - exit_price / entry_price    
+        except Exception as e:
+            print(f"Error calculating short return for {stock}: {e}")
+            monthly_stock_return = 0
+        if pd.notna(monthly_stock_return):
+            deleveraged_return = monthly_stock_return * (1 / beta_dict[stock])
+            short_returns += deleveraged_return
+    # go long 5 stocks with the lowest betas
+    for stock in five_smallest_betas:
+        entry_date = one_day_after(date)
+        original_date = datetime.strptime(entry_date, date_format)
+        one_month_later = original_date + timedelta(days=30)
+        exit_date = one_day_after(one_month_later.strftime(date_format))
+        
+        if stock not in historical_data:
+            continue
+        prices = historical_data[stock].loc[entry_date:exit_date]
+        if prices.empty:
+            continue
+        try:
+            entry_price = prices.iloc[0]['Adj Close'] * (1 + commission)
+            exit_price = prices.iloc[-1]['Adj Close'] * (1 - commission)
+            monthly_stock_return = exit_price / entry_price - 1
+        except Exception as e:
+            print(f"Error calculating long return for {stock}: {e}")
+            monthly_stock_return = 0
+        if pd.notna(monthly_stock_return):
+            leveraged_return = monthly_stock_return * abs(1 / beta_dict[stock])
+            long_returns += leveraged_return
+    
+    return (long_returns + short_returns) / 5
+
+# Use parallel processing to speed up computation
+with ThreadPoolExecutor(max_workers=8) as executor:
+    results = list(executor.map(process_date, month_end_range))
+    
+def annualied_geometric_return(returns): 
+    returns= [i + 1 for i in returns]
+    cumulative_returns = np.cumprod(returns)
+    geometric_return = cumulative_returns[-1] ** (1/len(cumulative_returns)) - 1
+    annualized_return = (1 + geometric_return) ** 12 -1
+    return annualized_return
+annualized_return = annualied_geometric_return(results)
+print("Annual return is " + "{:.2%}".format(annualized_return))
+
+
+# Plot results
+# Ensure month_end_range is a DatetimeIndex
+month_end_range = pd.to_datetime(month_end_range)
+
+# Create the returns Series
+returns = pd.Series(results, index=month_end_range)
+cumulative_returns = (1 + returns).cumprod()
+
+plt.figure(figsize=(14, 7))
+plt.plot(cumulative_returns, label='Betting Against Beta Strategy')
+plt.xlabel('Date')
+plt.ylabel('Cumulative Returns')
+plt.legend()
+plt.title('Betting Against Beta Strategy Performance')
+
+# Set major locator to year and format to only show year
+ax = plt.gca()
+ax.xaxis.set_major_locator(mdates.YearLocator())
+ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+
+plt.show()
+
+def calculate_max_drawdown(returns):
+    returns = [i+1 for i in returns]
+    cumulative_returns = np.cumprod(returns)
+    peak = np.maximum.accumulate(cumulative_returns)
+    drawdown = (cumulative_returns - peak) / peak
+    max_drawdown = np.min(drawdown)
+    return max_drawdown
+max_drawdown = calculate_max_drawdown(results)
+print("Maximum Drawdown:", "{:.2%}".format(max_drawdown))
+
+def calculate_sharpe_ratio(returns): 
+    monthly_returns = returns    
+    annual_risk_free_rate = risk_free_data['Risk-Free Rate'].mean()
+    monthly_risk_free_rate = (1 + annual_risk_free_rate)**(1/12) - 1
+    average_return = np.mean(monthly_returns)    
+    std_dev_returns = np.std(monthly_returns, ddof=1)
+    excess_return = average_return - monthly_risk_free_rate    
+    sharpe_ratio = excess_return / std_dev_returns
+    return sharpe_ratio
+sharpe_ratio = calculate_sharpe_ratio(returns)
+print(f"Sharpe Ratio: {sharpe_ratio:.4f}")
